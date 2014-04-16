@@ -13,20 +13,31 @@
 
 // To see debug! outputs set the RUST_LOG environment variable, e.g.: export RUST_LOG="zhtta=debug" 
 
-#[feature(globs)];
-extern mod extra;
+#![feature(globs)]
+#![feature(phase)]
+#[phase(syntax, link)] extern crate log;
+
+// extern crate extra;
+
+extern crate std;
+extern crate collections;
+extern crate sync;
+extern crate getopts;
 
 use std::io::*;
 use std::io::net::ip::{SocketAddr};
 use std::{os, str, libc, from_str};
-use std::hashmap::HashMap;
+use std::comm::{Sender, Receiver, channel};
 
-use extra::arc::{RWArc, MutexArc};
-use extra::priority_queue::PriorityQueue;
-use extra::sync::Semaphore;
-use extra::getopts;
+use collections::hashmap::HashMap;
+use collections::priority_queue::PriorityQueue;
 
-mod gash;
+use sync::raw::Semaphore;
+use sync::{Arc, Mutex, RWLock};
+
+
+
+// mod gash;
 
 static IP: &'static str = "127.0.0.1";
 static PORT:        uint = 4414;
@@ -44,9 +55,17 @@ struct HTTP_Request {
     priority: uint,
 }
 
-impl Ord for HTTP_Request {
+impl std::cmp::Ord for HTTP_Request {
+
     fn lt(&self, other: &HTTP_Request) -> bool {
         if self.priority > other.priority { true } else { false }
+    }
+}
+
+impl std::cmp::Eq for HTTP_Request {
+
+    fn eq(&self, other: &HTTP_Request) -> bool {
+        self.priority == other.priority
     }
 }
 
@@ -66,16 +85,16 @@ struct WebServer {
     file_chunk_size: uint,
     
     concurrency_sem: Semaphore,
-    visitor_count_arc: RWArc<uint>,
-    request_queue_arc: MutexArc<PriorityQueue<HTTP_Request>>,
-    stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
+    visitor_count_arc: Arc<RWLock<uint>>,
+    request_queue_arc: Arc<Mutex<PriorityQueue<HTTP_Request>>>,
+    stream_map_arc: Arc<Mutex<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>>,
     
-    notify_port: Port<()>,
-    shared_notify_chan: SharedChan<()>,
+    notify_port: Receiver<()>,
+    shared_notify_chan: Sender<()>,
     
-    // `std::hashmap::HashMap<~str,extra::arc::RWArc<CacheItem>>` does not fulfill `Freeze`
-    // So I have to use the unsafe method in MutexArc instead.
-    cache_arc: MutexArc<HashMap<~str, RWArc<CacheItem>>>,
+    // `std::hashmap::HashMap<~str,extra::arc::Arc<CacheItem>>` does not fulfill `Freeze`
+    // So I have to use the unsafe method in Mutex instead.
+    cache_arc: Arc<Mutex<HashMap<~str, Arc<CacheItem>>>>,
 }
 
 impl WebServer {
@@ -83,7 +102,7 @@ impl WebServer {
         // TODO: chroot jail
         let www_dir_path = ~Path::new(www_dir);
         os::change_dir(www_dir_path.clone());
-        let (notify_port, shared_notify_chan) = SharedChan::new();
+        let (shared_notify_chan, notify_port) = channel();
         WebServer {
             ip: ip.to_owned(),
             port: port,
@@ -91,16 +110,16 @@ impl WebServer {
             max_concurrency: max_concurrency,
             file_chunk_size: file_chunk_size,
             
-            visitor_count_arc: RWArc::new(0 as uint),
+            visitor_count_arc: Arc::new(RWLock::new(0 as uint)),
             concurrency_sem: Semaphore::new(max_concurrency as int),
             
-            request_queue_arc: MutexArc::new(PriorityQueue::new()),
-            stream_map_arc: MutexArc::new(HashMap::new()),
+            request_queue_arc: Arc::new(Mutex::new(PriorityQueue::new())),
+            stream_map_arc: Arc::new(Mutex::new(HashMap::new())),
             
             notify_port: notify_port,
             shared_notify_chan: shared_notify_chan,
             
-            cache_arc: MutexArc::new(HashMap::new()),
+            cache_arc: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -122,13 +141,13 @@ impl WebServer {
         let cache_arc = self.cache_arc.clone();
         let file_chunk_size = self.file_chunk_size;
         
-        do spawn {
+        spawn (proc(){
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
             println!("Listening on [{:s}] ...", addr.to_str());
             println!("Working directory in [{:s}].", www_dir_path_str);
             
             for stream in acceptor.incoming() {
-                let (queue_port, queue_chan) = Chan::new();
+                let (queue_chan, queue_port) = channel();
                 queue_chan.send(request_queue_arc.clone());
                 
                 let notify_chan = shared_notify_chan.clone();
@@ -137,20 +156,23 @@ impl WebServer {
                 //let file_chunk_size = file_chunk_size;
                 let visitor_count_arc = visitor_count_arc.clone();
                 // Spawn a task to handle the connection
-                do spawn {
-                    visitor_count_arc.write(|count| {
-                        *count += 1;
-                    });
+                std::task::spawn (proc(){
+                    // visitor_count_arc.write(|count| {
+                    //     *count += 1;
+                    // });
+                    let mut count = visitor_count_arc.write();
+                    *count += 1;
+                    let count = count.downgrade();
                     let req_queue_arc = queue_port.recv();
                   
-                    let mut stream = stream;
+                    let mut stream = stream.ok();
                     
                     let peer_name = WebServer::get_peer_name(&mut stream);
                     debug!("=====Received connection from: [{:s}]=====", peer_name);
                     
                     let mut buf = [0, ..500];
-                    stream.read(buf);
-                    let request_str = str::from_utf8(buf);
+                    stream.unwrap().read(buf);
+                    let request_str = str::from_utf8(buf).unwrap();
                     debug!("Request :\n{:s}", request_str);
                     
                     let req_group : ~[&str]= request_str.splitn(' ', 3).collect();
@@ -168,12 +190,15 @@ impl WebServer {
                         if !path_obj.exists() || path_obj.is_dir() {
                             WebServer::respond_with_default_page(stream, visitor_count_arc);
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
-                        } else if ext_str == "shtml" { // Dynamic web pages.
-                            WebServer::respond_with_dynamic_page(stream, path_obj);
-                            debug!("=====Terminated connection from [{:s}].=====", peer_name);
-                        } else { // Static file request. Dealing with complex queuing, chunk reading, caching...
+                        } 
+                        // else if ext_str == "shtml" { // Dynamic web pages.
+                        //     WebServer::respond_with_dynamic_page(stream, path_obj);
+                        //     debug!("=====Terminated connection from [{:s}].=====", peer_name);
+                        // } 
+                        else { // Static file request. Dealing with complex queuing, chunk reading, caching...
                             // request scheduling
-                            let file_size = std::io::fs::stat(path_obj).size as uint;
+                            // let file_size = std::io::fs::stat(path_obj).size as uint;
+                            let file_size = path_obj.stat().unwrap().size as uint;
                             if file_size < 8000000 {
                                 WebServer::respond_with_static_file(cache_arc, path_obj, stream, file_size, file_chunk_size);
                             } else {
@@ -181,14 +206,14 @@ impl WebServer {
                             }
                         }
                     }
-                }
+                });
             } // for
-        }
+        });
     }
     
-    fn respond_with_default_page(stream: Option<std::io::net::tcp::TcpStream>, visitor_count_arc: RWArc<uint>) {
+    fn respond_with_default_page(stream: Option<std::io::net::tcp::TcpStream>, visitor_count_arc: Arc<RWLock<uint>>) {
         //let visitor_count_arc = self.visitor_count_arc.clone();
-        let mut stream = stream;
+        let mut stream = stream.unwrap();
         let response: ~str = 
             format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n
              <doctype !html><html><head><title>Hello, Rust!</title>
@@ -199,50 +224,50 @@ impl WebServer {
              <body>
              <h1>Greetings, Krusty!</h1>
              <h2>Visitor count: {0:u}</h2>
-             </body></html>\r\n", visitor_count_arc.read(|count| {*count}));
+             </body></html>\r\n", *(visitor_count_arc.clone().read()));
         stream.write(response.as_bytes());
     }
     
-    fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path) {
-        let mut stream = stream;
-        let contents = File::open(path_obj).read_to_str();
-        stream.write("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n".as_bytes());
-        // TODO: improve the parsing code.
-        for line in contents.lines() {
-            if line.contains("<!--#exec cmd=\"") {
-                let start = line.find_str("<!--#exec cmd=\"").unwrap();
-                let start_cmd = start + 15;
-                let mut end_cmd = -1;
-                let mut end = -1;
-                for i in range(start_cmd+1, line.len()) {
-                    if line.char_at(i) == '"' {
-                        end_cmd = i;
-                    } else if line.char_at(i) == '>' {
-                        end = i + 1;
-                    }
-                    if end_cmd != -1 && end != -1 {
-                        break;
-                    }
-                }
-                if end_cmd == -1 || end == -1 || end_cmd >= end {
-                    stream.write(line.as_bytes());
-                } else {
-                    stream.write(line.slice_to(start).as_bytes());
-                    let cmd = line.slice(start_cmd, end_cmd);
-                    let ret_str = gash::run_cmdline(cmd);
-                    stream.write(ret_str.as_bytes());
-                    stream.write(line.slice_from(end).as_bytes());
-                }
-            } else {
-                stream.write(line.as_bytes());
-            }
-        }
-    }
+    // fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path) {
+    //     let mut stream = stream;
+    //     let contents = File::open(path_obj).read_to_str();
+    //     stream.write("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n".as_bytes());
+    //     // TODO: improve the parsing code.
+    //     for line in contents.lines() {
+    //         if line.contains("<!--#exec cmd=\"") {
+    //             let start = line.find_str("<!--#exec cmd=\"").unwrap();
+    //             let start_cmd = start + 15;
+    //             let mut end_cmd = -1;
+    //             let mut end = -1;
+    //             for i in range(start_cmd+1, line.len()) {
+    //                 if line.char_at(i) == '"' {
+    //                     end_cmd = i;
+    //                 } else if line.char_at(i) == '>' {
+    //                     end = i + 1;
+    //                 }
+    //                 if end_cmd != -1 && end != -1 {
+    //                     break;
+    //                 }
+    //             }
+    //             if end_cmd == -1 || end == -1 || end_cmd >= end {
+    //                 stream.write(line.as_bytes());
+    //             } else {
+    //                 stream.write(line.slice_to(start).as_bytes());
+    //                 let cmd = line.slice(start_cmd, end_cmd);
+    //                 let ret_str = gash::run_cmdline(cmd);
+    //                 stream.write(ret_str.as_bytes());
+    //                 stream.write(line.slice_from(end).as_bytes());
+    //             }
+    //         } else {
+    //             stream.write(line.as_bytes());
+    //         }
+    //     }
+    // }
     
     // Streaming file, Application-layer caching, 
-    fn respond_with_static_file(cache_arc: MutexArc<HashMap<~str, RWArc<CacheItem>>>, path: &Path, stream: Option<std::io::net::tcp::TcpStream>, file_size: uint, file_chunk_size: uint) {
-        let mut stream = stream;
-        let path_str = path.as_str().expect("invalid path");
+    fn respond_with_static_file(cache_arc: Arc<Mutex<HashMap<~str, Arc<CacheItem>>>>, path: &Path, stream: Option<std::io::net::tcp::TcpStream>, file_size: uint, file_chunk_size: uint) {
+        let mut stream = stream.unwrap();
+        let path_str = path.as_str().unwrap();
         
         /* pseudo code for caching
         
@@ -262,17 +287,17 @@ impl WebServer {
         if file_size > 200000000 {
             // Ignore the caching.
             debug!("Start reading {} in disk.", path_str);
-            let mut file_reader = File::open(path).expect("invalid file!");
+            let mut file_reader = File::open(path).ok().unwrap();
             stream.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream; charset=UTF-8\r\n\r\n".as_bytes());
             
             // streaming file.
             // read_bytes() raises io_error on EOF. Consequently, we should count the remaining bytes ourselves.
             let mut remaining_bytes = file_size;
             while (remaining_bytes >= file_chunk_size) {
-                stream.write(file_reader.read_bytes(file_chunk_size));
+                stream.write(file_reader.read_exact(file_chunk_size).ok().unwrap());
                 remaining_bytes -= file_chunk_size;
             }
-            stream.write(file_reader.read_bytes(remaining_bytes));
+            stream.write(file_reader.read_exact(remaining_bytes).ok().unwrap());
             debug!("Stop reading {} in disk.", path_str);
         } else {
             let mut cache_item_status;
@@ -305,27 +330,27 @@ impl WebServer {
                 }
                 // It doesn't hit in cache, just read from file.
                 debug!("Start reading {} in disk.", path_str);
-                let mut file_reader = File::open(path).expect("invalid file!");
+                let mut file_reader = File::open(path).ok().unwrap();
                 stream.write("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream; charset=UTF-8\r\n\r\n".as_bytes());
                 
                 // streaming file.
                 // read_bytes() raises io_error on EOF. Consequently, we should count the remaining bytes ourselves.
                 let mut remaining_bytes = file_size;
                 while (remaining_bytes >= file_chunk_size) {
-                    stream.write(file_reader.read_bytes(file_chunk_size));
+                    stream.write(file_reader.read_exact(file_chunk_size).ok().unwrap());
                     remaining_bytes -= file_chunk_size;
                 }
-                stream.write(file_reader.read_bytes(remaining_bytes));
+                stream.write(file_reader.read_exact(remaining_bytes).ok().unwrap());
                 debug!("Finish reading {} in disk.", path_str);
             }
         }
     }
 
-    fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<PriorityQueue<HTTP_Request>>, shared_notify_chan: SharedChan<()>) {
+    fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: Arc<Mutex<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>>, req_queue_arc: Arc<Mutex<PriorityQueue<HTTP_Request>>>, shared_notify_chan: Sender<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
         let peer_name = WebServer::get_peer_name(&mut stream);
-        let (stream_port, stream_chan) = Chan::new();
+        let (stream_chan, stream_port) = channel();
         stream_chan.send(stream);
         unsafe {
             // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
@@ -336,12 +361,12 @@ impl WebServer {
         }
         
         // Get file size.
-        let file_size = std::io::fs::stat(path_obj).size as uint;
-        
+        // let file_size = std::io::fs::stat(path_obj).size as uint;
+        let file_size = path_obj.stat().unwrap().size as uint;
         // Enqueue the HTTP request.
         let req = HTTP_Request{peer_name: peer_name.clone(), path: ~path_obj.clone(), file_size: file_size, priority: file_size};
         
-        let (req_port, req_chan) = Chan::new();
+        let (req_chan, req_port) = channel();
         req_chan.send(req);
         debug!("Waiting for queue mutex.");
         req_queue_arc.access(|local_req_queue| {
@@ -363,7 +388,7 @@ impl WebServer {
         
         // Port<> could not be sent to another task. So I have to make it as the main task that can access self.notify_port.
         
-        let (request_port, request_chan) = Chan::new();
+        let (request_chan, request_port) = channel();
         loop {
             concurrency_sem.acquire();  // waiting for concurrency semaphore.
             self.notify_port.recv();    // waiting for new request enqueued.
@@ -383,7 +408,7 @@ impl WebServer {
             
             // Get stream from hashmap.
             // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
-            let (stream_port, stream_chan) = Chan::new();
+            let (stream_chan, stream_port) = channel();
             
             unsafe {
                 stream_map_get.unsafe_access(|local_stream_map| {
@@ -395,14 +420,14 @@ impl WebServer {
             // Spawn several tasks to respond the requests concurrently.
             let child_concurrency_sem = concurrency_sem.clone();
             let cache_arc = self.cache_arc.clone();
-            do spawn {
+            spawn (proc(){
                 let stream = stream_port.recv();
                 // Respond with file content.
                 WebServer::respond_with_static_file(cache_arc, request.path, stream, request.file_size, file_chunk_size);
                 // Close stream automatically.
                 debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
                 child_concurrency_sem.release();
-            }
+            });
         }
     }
     
@@ -418,8 +443,8 @@ impl WebServer {
         }
     }
     
-    fn get_cache_item_arc(cache_arc: MutexArc<HashMap<~str, RWArc<CacheItem>>>, path_str: &str) -> RWArc<CacheItem> {
-        let (cache_item_arc_port, cache_item_arc_chan) = Chan::new();
+    fn get_cache_item_arc(cache_arc: Arc<Mutex<HashMap<~str, Arc<CacheItem>>>>, path_str: &str) -> Arc<CacheItem> {
+        let (cache_item_arc_chan, cache_item_arc_port) = channel();
         unsafe {
             cache_arc.unsafe_access(|cache| {
                 let cache_item_arc_opt = cache.find(&path_str.to_owned());
@@ -432,11 +457,11 @@ impl WebServer {
         cache_item_arc_port.recv()
     }
     
-    fn insert_cache_item(cache_arc: MutexArc<HashMap<~str, RWArc<CacheItem>>>, path: ~Path, file_size: uint) {
+    fn insert_cache_item(cache_arc: Arc<Mutex<HashMap<~str, Arc<CacheItem>>>>, path: ~Path, file_size: uint) {
         let cache_arc = cache_arc.clone();
         let path_str = path.as_str().expect("invalid path?").to_owned();
         
-        do spawn {
+        spawn (proc(){
             // insert a cached item with status UPDATING, so that other tasks will just ignore it.
             // then update the cached item, and set the status as OK.
             
@@ -450,7 +475,7 @@ impl WebServer {
                             file_size: file_size,
                             status: 1, //0: OK, 1: UPDATING
                         };
-                        cache.insert(path_str.to_owned(), RWArc::new(inited_cache_item));
+                        cache.insert(path_str.to_owned(), Arc::new(inited_cache_item));
                         to_be_updated = true;
                     } else { // just exit, since other task is updating it.
                         to_be_updated = false;
@@ -464,7 +489,7 @@ impl WebServer {
                 let mut file_reader = File::open(path).expect("invalid file!");
                 let file_data = file_reader.read_to_end();
                 
-                let (file_data_port, file_data_chan) = Chan::new();
+                let (file_data_chan, file_data_port) = channel();
                 file_data_chan.send(file_data);
                 
                 let cache_item_arc = WebServer::get_cache_item_arc(cache_arc, path_str);
@@ -474,7 +499,7 @@ impl WebServer {
                     cache_item.status = 0;
                 });
             }
-        } // do spawn for updating catch on the background.
+        }); // do spawn for updating catch on the background.
     }
 }
 
